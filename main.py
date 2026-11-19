@@ -23,16 +23,23 @@ class ValveTestBench(QMainWindow):
         self.resize(1300, 750)
 
         # --- Аппаратные настройки ---
-        self.ADDR_DO = 1
-        self.ADDR_AO = 2
-        self.ADDR_FLOW = 86
+        self.ADDR_DO = "01"   # I-7050D (DCON)
+        self.ADDR_AO = "02"   # I-7017 (DCON)
+        self.ADDR_FLOW = 86   # M-7041D (Modbus RTU)
 
-        # Каналы DO (M-7050)
+        # Каналы DO (I-7050D)
         self.DO_VALVE_FWD_IN = 1
         self.DO_VALVE_REV_OUT = 2
         self.DO_VALVE_FWD_OUT = 3
         self.DO_VALVE_REV_IN = 4
         self.DO_PUMP_START = 5
+
+        # Калибровка датчика давления (I-7017, канал 5) из оригинального VB.NET
+        self.AI_PRESSURE_CH = 5
+        self.MIN_MA = 3.86
+        self.MAX_MA = 19.368
+        self.MIN_P = 0.0
+        self.MAX_P = 6.0
 
         # Каналы расходомера (M-7041D, вход 10)
         self.FLOW_INPUT_REG = 10
@@ -46,7 +53,7 @@ class ValveTestBench(QMainWindow):
             self.DO_VALVE_REV_IN: False,
             self.DO_PUMP_START: False,
         }
-        self.raw_pressure = 0
+        self.raw_pressure_ma = 0.0
         self.current_pressure = 0.0
         self.current_flow = 0
         self.fixed_open = 0.0
@@ -66,7 +73,6 @@ class ValveTestBench(QMainWindow):
         self.timer.start(200)
 
     def _create_led(self):
-        """Создает круглый LED-индикатор (по умолчанию красный)"""
         led = QLabel()
         led.setFixedSize(16, 16)
         led.setStyleSheet(
@@ -142,7 +148,7 @@ class ValveTestBench(QMainWindow):
         self.btn_service.clicked.connect(self.toggle_service_mode)
         left_layout.addWidget(self.btn_service)
 
-        # --- Панель диагностики регистров (под кнопкой сервисного режима) ---
+        # --- Панель диагностики регистров ---
         self.service_panel = QGroupBox("Диагностика регистров (Сервисный режим)")
         self.service_panel.setStyleSheet(
             "QGroupBox { font-weight: bold; font-size: 13px; background-color: #f8f9fa; border: 1px solid #ccc; margin-top: 8px; padding-top: 10px; }"
@@ -151,7 +157,7 @@ class ValveTestBench(QMainWindow):
         srv_layout = QVBoxLayout(self.service_panel)
         srv_layout.setSpacing(6)
 
-        # Дискретные выходы (ID 1)
+        # Дискретные выходы (I-7050D, DCON #01)
         do_grid = QGridLayout()
         do_items = [
             (self.DO_VALVE_FWD_IN, "DO1 (В прям.)"),
@@ -175,15 +181,15 @@ class ValveTestBench(QMainWindow):
 
         srv_layout.addLayout(do_grid)
 
-        # Аналоговый вход (ID 2, Reg 5)
-        self.lbl_srv_ai = QLabel("AI5 (Давление, ID 2): Raw = 0 | Расчет = 0.00 атм")
+        # Аналоговый вход (I-7017, DCON #025)
+        self.lbl_srv_ai = QLabel("AI5 (I-7017, #025): Ток = 0.000 мА | Давление = 0.00 атм")
         self.lbl_srv_ai.setStyleSheet(
             "background-color: #e9ecef; padding: 4px 6px; font-size: 13px; font-weight: bold; border-radius: 3px;"
         )
         srv_layout.addWidget(self.lbl_srv_ai)
 
-        # Расходомер (ID 86, Input Reg 10)
-        self.lbl_srv_flow = QLabel("Расходомер (ID 86, Input Reg 10): 0 ед.")
+        # Расходомер (M-7041D, Modbus ID 86, Input Reg 10)
+        self.lbl_srv_flow = QLabel("Расходомер (M-7041D, ID 86, Reg 10): 0 ед.")
         self.lbl_srv_flow.setStyleSheet(
             "background-color: #fff3cd; padding: 4px 6px; font-size: 13px; font-weight: bold; border-radius: 3px;"
         )
@@ -300,13 +306,13 @@ class ValveTestBench(QMainWindow):
             return
 
         self.modbus = ModbusSerialClient(
-            port='COM3',
+            port='COM11',
             baudrate=57600,
-            timeout=0.1
+            timeout=1
         )
         if self.modbus.connect():
             self.port_ok = True
-            self.log("Подключение к COM3 установлено.")
+            self.log("Подключение к COM11 (DCON + Modbus RTU) установлено.")
         else:
             self.port_ok = False
             self.set_buttons_enabled(False)
@@ -322,19 +328,31 @@ class ValveTestBench(QMainWindow):
             html = f'<span>[{t}] {text}</span>'
         self.log_console.append(html)
 
-    # ================== АППАРАТНЫЙ УРОВЕНЬ ==================
+    # ================== АППАРАТНЫЙ УРОВЕНЬ (DCON + MODBUS) ==================
+    def send_dcon(self, cmd: str) -> str:
+        """Отправка DCON-команды через уже открытый COM-порт pymodbus"""
+        if DUMMY_MODE or not self.port_ok:
+            return ""
+        try:
+            ser = self.modbus.socket
+            ser.reset_input_buffer()
+            ser.write(f"{cmd}\r".encode("ascii"))
+            return ser.read_until(b"\r").decode("ascii", errors="ignore").strip()
+        except Exception as e:
+            self.log(f"Ошибка DCON ({cmd}): {e}", is_error=True)
+            return ""
+
     def write_do(self, channel, state):
+        """Управление реле I-7050D по DCON (#011C0V)"""
         self.do_states[channel] = state
         self.update_valve_ui(channel, state)
         if DUMMY_MODE:
             return
-        try:
-            self.modbus.write_coil(channel, state, device_id=self.ADDR_DO)
-        except Exception as e:
-            self.log(f"Ошибка записи Modbus DO: {e}", is_error=True)
+        val = 1 if state else 0
+        self.send_dcon(f"#{self.ADDR_DO}1{channel}0{val}")
 
     def clear_flow_counter(self):
-        """Сброс счетчика 10-го входа на M-7041D (Coil 522)"""
+        """Сброс счетчика 10-го входа на M-7041D (Modbus Coil 522)"""
         self.current_flow = 0
         if DUMMY_MODE:
             return
@@ -358,20 +376,27 @@ class ValveTestBench(QMainWindow):
             else:
                 self.current_pressure = max(0.0, self.current_pressure - 0.1)
 
-            self.raw_pressure = int((self.current_pressure / 6.0) * 65535)
+            self.raw_pressure_ma = self.MIN_MA + (self.current_pressure / self.MAX_P) * (self.MAX_MA - self.MIN_MA)
             return
 
         if not self.port_ok:
             return
 
-        try:
-            # Чтение АЦП (канал 5)
-            res_ai = self.modbus.read_input_registers(address=5, count=1, device_id=self.ADDR_AO)
-            if not res_ai.isError():
-                self.raw_pressure = res_ai.registers[0]
-                self.current_pressure = (self.raw_pressure / 65535.0) * 6.0
+        # 1. Чтение давления с I-7017 (DCON #025 -> возвращает мА)
+        resp = self.send_dcon(f"#{self.ADDR_AO}{self.AI_PRESSURE_CH}")
+        if resp.startswith(">"):
+            try:
+                ma = float(resp[1:])
+                self.raw_pressure_ma = ma
+                # Калибровочная формула из оригинального VB.NET
+                self.current_pressure = round(
+                    abs(ma - self.MIN_MA) * (self.MAX_P - self.MIN_P) / (self.MAX_MA - self.MIN_MA), 2
+                )
+            except ValueError:
+                pass
 
-            # Чтение счетчика расходомера (M-7041D, Input Register 10)
+        # 2. Чтение счетчика расходомера с M-7041D (Modbus RTU, Input Register 10)
+        try:
             res_flow = self.modbus.read_input_registers(
                 address=self.FLOW_INPUT_REG, count=1, device_id=self.ADDR_FLOW
             )
@@ -453,10 +478,10 @@ class ValveTestBench(QMainWindow):
 
         if self.service_mode:
             self.lbl_srv_ai.setText(
-                f"AI5 (Давление, ID 2): Raw = {self.raw_pressure} | Расчет = {self.current_pressure:.2f} атм"
+                f"AI5 (I-7017, #025): Ток = {self.raw_pressure_ma:.3f} мА | Давление = {self.current_pressure:.2f} атм"
             )
             self.lbl_srv_flow.setText(
-                f"Расходомер (ID 86, Input Reg 10): {self.current_flow} ед."
+                f"Расходомер (M-7041D, ID 86, Reg 10): {self.current_flow} ед."
             )
 
         if self.state not in ["IDLE", "AUTO_PAUSE"] or self.current_pressure > 0.1:
