@@ -1,4 +1,16 @@
 import sys
+import os
+
+def resource_path(filename: str) -> str:
+    """Путь к ресурсам (shem.png), вшитым в exe"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, filename)
+
+def app_dir() -> str:
+    """Папка, в которой лежит exe (или main.py) — для config.ini"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 import time
 import queue
 import logging
@@ -17,17 +29,17 @@ from pymodbus.client import ModbusSerialClient
 logging.getLogger("pymodbus").setLevel(logging.CRITICAL)
 
 # Поставьте True для проверки без подключенного стенда
-DUMMY_MODE = False
+DUMMY_MODE = True
 
 
 class CommWorker(QThread):
     """Фоновый поток для всей работы с COM-портом (DCON + Modbus RTU + Watchdog слейвов)"""
-    telemetry_updated = pyqtSignal(float, float, int)     # (raw_ma, pressure_atm, flow)
-    connection_changed = pyqtSignal(bool, str, bool)      # (is_connected, message, is_initial)
-    slaves_status_changed = pyqtSignal(bool, bool, bool)  # (do_ok, ai_ok, flow_ok)
+    telemetry_updated = pyqtSignal(float, float, int, int, int)  # (raw_ma, pressure_atm, flow_fwd, flow_rev, pedal)
+    connection_changed = pyqtSignal(bool, str, bool)             # (is_connected, message, is_initial)
+    slaves_status_changed = pyqtSignal(bool, bool, bool)         # (do_ok, ai_ok, flow_ok)
 
     def __init__(self, port, baudrate, addr_do, addr_ao, ai_ch,
-                 addr_flow, flow_reg, flow_clear_coil,
+                 addr_flow, flow_reg_start, flow_fwd_clear_coil, flow_rev_clear_coil,
                  min_ma, max_ma, min_p, max_p, max_missed=5):
         super().__init__()
         self.com_port = port
@@ -36,8 +48,9 @@ class CommWorker(QThread):
         self.addr_ao = addr_ao
         self.ai_ch = ai_ch
         self.addr_flow = addr_flow
-        self.flow_reg = flow_reg
-        self.flow_clear_coil = flow_clear_coil
+        self.flow_reg_start = flow_reg_start
+        self.flow_fwd_clear_coil = flow_fwd_clear_coil
+        self.flow_rev_clear_coil = flow_rev_clear_coil
         self.min_ma = min_ma
         self.max_ma = max_ma
         self.min_p = min_p
@@ -62,13 +75,15 @@ class CommWorker(QThread):
 
         self.raw_ma = 0.0
         self.pressure = 0.0
-        self.flow = 0
+        self.flow_fwd = 0
+        self.flow_rev = 0
+        self.pedal_count = 0
 
     def enqueue_do(self, channel: int, state: bool):
         self.cmd_queue.put(("write_do", channel, state))
 
-    def enqueue_clear_flow(self):
-        self.cmd_queue.put(("clear_flow",))
+    def enqueue_clear_flow(self, coil: int):
+        self.cmd_queue.put(("clear_flow", coil))
 
     def enqueue_change_port(self, new_port: str):
         self.cmd_queue.put(("change_port", new_port))
@@ -179,10 +194,12 @@ class CommWorker(QThread):
                     val = 1 if state else 0
                     self._send_dcon(f"#{self.addr_do}1{channel}0{val}")
                 elif action == "clear_flow":
-                    self.modbus.write_coil(
-                        self.flow_clear_coil, True, device_id=self.addr_flow
-                    )
-                    self.flow = 0
+                    _, coil = cmd
+                    self.modbus.write_coil(coil, True, device_id=self.addr_flow)
+                    if coil == self.flow_fwd_clear_coil:
+                        self.flow_fwd = 0
+                    elif coil == self.flow_rev_clear_coil:
+                        self.flow_rev = 0
             except (SerialException, OSError):
                 self._handle_disconnect()
                 return
@@ -236,12 +253,14 @@ class CommWorker(QThread):
                     if self.err_ai >= self.max_missed:
                         self.ai_ok = False
 
-                # 3. Опрос счетчика расходомера M-7041D (Modbus RTU, Input Reg 10)
+                # 3. Опрос счетчиков M-7041D: Reg 10 (прямой), Reg 11 (обратный), Reg 12 (педаль)
                 res_flow = self.modbus.read_input_registers(
-                    address=self.flow_reg, count=1, device_id=self.addr_flow
+                    address=self.flow_reg_start, count=3, device_id=self.addr_flow
                 )
                 if not res_flow.isError():
-                    self.flow = res_flow.registers[0]
+                    self.flow_fwd = res_flow.registers[0]
+                    self.flow_rev = res_flow.registers[1]
+                    self.pedal_count = res_flow.registers[2]
                     self.err_flow = 0
                     self.flow_ok = True
                 else:
@@ -254,7 +273,9 @@ class CommWorker(QThread):
                 if curr_status != prev_status:
                     self.slaves_status_changed.emit(*curr_status)
 
-                self.telemetry_updated.emit(self.raw_ma, self.pressure, self.flow)
+                self.telemetry_updated.emit(
+                    self.raw_ma, self.pressure, self.flow_fwd, self.flow_rev, self.pedal_count
+                )
 
             except (SerialException, OSError):
                 self._handle_disconnect()
@@ -279,13 +300,13 @@ class ValveTestBench(QMainWindow):
         self.ignore_flow_until = 0.0
 
         # Загрузка сохраненного COM-порта из config.ini
-        self.settings = QSettings("config.ini", QSettings.Format.IniFormat)
+        self.settings = QSettings(os.path.join(app_dir(), "config.ini"), QSettings.Format.IniFormat)
         self.COM_PORT = str(self.settings.value("com_port", "COM3"))
         self.BAUDRATE = 57600
         self.MAX_MISSED_POLLS = 5
 
         self.setWindowTitle("Стенд тестирования перепускных клапанов")
-        self.resize(1300, 780)
+        self.resize(1300, 800)
 
         # --- Аппаратные настройки ---
         self.ADDR_DO = "01"   # I-7050D (DCON)
@@ -299,6 +320,14 @@ class ValveTestBench(QMainWindow):
         self.DO_VALVE_REV_IN = 4
         self.DO_PUMP_START = 5
 
+        self.DO_NAMES = {
+            self.DO_VALVE_FWD_IN: "DO1 (В прям.)",
+            self.DO_VALVE_REV_OUT: "DO2 (Из обр.)",
+            self.DO_VALVE_FWD_OUT: "DO3 (Из прям.)",
+            self.DO_VALVE_REV_IN: "DO4 (В обр.)",
+            self.DO_PUMP_START: "DO5 (Насос)",
+        }
+
         # Калибровка датчика давления (I-7017, канал 5)
         self.AI_PRESSURE_CH = 5
         self.MIN_MA = 3.86
@@ -306,29 +335,39 @@ class ValveTestBench(QMainWindow):
         self.MIN_P = 0.0
         self.MAX_P = 6.0
 
-        # Каналы расходомера (M-7041D, вход 10)
-        self.FLOW_INPUT_REG = 10
-        self.FLOW_CLEAR_COIL = 522
+        # Каналы M-7041D: вход 10 — прямой, вход 11 — обратный, вход 12 — педаль
+        self.FLOW_FWD_REG = 10
+        self.FLOW_REV_REG = 11
+        self.PEDAL_REG = 12
+        self.FLOW_FWD_CLEAR_COIL = 522
+        self.FLOW_REV_CLEAR_COIL = 523
+
+        # Настройки педали (антидребезг 1.0 сек)
+        self.PEDAL_DEBOUNCE_TIME = 1.0
+        self.pedal_count = 0
+        self.last_pedal_count = None
+        self.pedal_lock_until = 0.0
+
+        # Настройки прямого теста (фиксация остановки потока)
+        self.FLOW_STOP_TIMEOUT = 1.5   # Сек без новых импульсов = клапан закрылся
+        self.last_flow_val = 0
+        self.last_flow_time = 0.0
+        self.last_flow_pressure = 0.0
 
         # Настройки переходов и обратного теста
         self.AUTO_PAUSE_TIME = 5.0     # Пауза после падения давления ниже 0.2 атм (сек)
         self.auto_pause_start_time = None
         self.REV_STABILIZE_TIME = 5.0  # Стабилизация (сек)
         self.REV_TEST_TIME = 30.0      # Контроль герметичности (сек)
-        self.rev_flow_baseline = 0     # Запомненное значение счетчика после стабилизации
+        self.rev_flow_baseline = 0     # Запомненное значение счетчика (вход 11) после стабилизации
         self.rev_test_start_time = 0.0
 
         # Текущие состояния регистров для диагностики
-        self.do_states = {
-            self.DO_VALVE_FWD_IN: False,
-            self.DO_VALVE_REV_OUT: False,
-            self.DO_VALVE_FWD_OUT: False,
-            self.DO_VALVE_REV_IN: False,
-            self.DO_PUMP_START: False,
-        }
+        self.do_states = {ch: False for ch in self.DO_NAMES}
         self.raw_pressure_ma = 0.0
         self.current_pressure = 0.0
-        self.current_flow = 0
+        self.flow_fwd = 0
+        self.flow_rev = 0
         self.fixed_open = 0.0
 
         # --- Переменные состояния ---
@@ -378,6 +417,12 @@ class ValveTestBench(QMainWindow):
             f"background-color: {color}; border-radius: 8px; border: 1px solid #333;"
         )
 
+    def _update_manual_buttons(self):
+        """Ручное управление доступно только в режиме простоя при открытом COM-порте"""
+        can_manual = self.port_ok and (self.state == "IDLE")
+        for btn in self.manual_do_btns.values():
+            btn.setEnabled(can_manual)
+
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -396,7 +441,7 @@ class ValveTestBench(QMainWindow):
 
         self.schematic_label = QLabel()
         try:
-            pixmap = QPixmap("shem.png").scaled(schem_w, schem_h, Qt.AspectRatioMode.IgnoreAspectRatio)
+            pixmap = QPixmap(resource_path("shem.png")).scaled(schem_w, schem_h, Qt.AspectRatioMode.IgnoreAspectRatio)
             self.schematic_label.setPixmap(pixmap)
             self.schematic_label.setFixedSize(schem_w, schem_h)
         except Exception:
@@ -440,8 +485,8 @@ class ValveTestBench(QMainWindow):
         self.btn_service.clicked.connect(self.toggle_service_mode)
         left_layout.addWidget(self.btn_service)
 
-        # --- Панель диагностики и настроек ---
-        self.service_panel = QGroupBox("Диагностика и настройки (Сервисный режим)")
+        # --- Панель диагностики и ручного управления ---
+        self.service_panel = QGroupBox("Диагностика и ручное управление (Сервисный режим)")
         self.service_panel.setStyleSheet(
             "QGroupBox { font-weight: bold; font-size: 13px; background-color: #f8f9fa; border: 1px solid #ccc; margin-top: 8px; padding-top: 10px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
@@ -472,26 +517,31 @@ class ValveTestBench(QMainWindow):
         com_layout.addWidget(self.btn_apply_port)
         srv_layout.addLayout(com_layout)
 
+        # Сетка ручного управления DO1..DO5 (LED + кнопка переключения)
         do_grid = QGridLayout()
-        do_items = [
-            (self.DO_VALVE_FWD_IN, "DO1 (В прям.)"),
-            (self.DO_VALVE_REV_OUT, "DO2 (Из обр.)"),
-            (self.DO_VALVE_FWD_OUT, "DO3 (Из прям.)"),
-            (self.DO_VALVE_REV_IN, "DO4 (В обр.)"),
-            (self.DO_PUMP_START, "DO5 (Насос)"),
-        ]
+        do_grid.setSpacing(5)
         self.do_leds = {}
-        for idx, (ch, name) in enumerate(do_items):
+        self.manual_do_btns = {}
+
+        for idx, (ch, name) in enumerate(self.DO_NAMES.items()):
             cell = QHBoxLayout()
-            cell.setContentsMargins(0, 0, 8, 0)
+            cell.setContentsMargins(0, 0, 4, 0)
             led = self._create_led()
-            lbl = QLabel(name)
-            lbl.setStyleSheet("font-size: 12px; font-weight: normal;")
+            btn = QPushButton(name)
+            btn.setStyleSheet("font-size: 12px; padding: 4px 6px;")
+            btn.clicked.connect(lambda checked, c=ch: self.toggle_manual_do(c))
             cell.addWidget(led)
-            cell.addWidget(lbl)
-            cell.addStretch()
+            cell.addWidget(btn, stretch=1)
             self.do_leds[ch] = led
+            self.manual_do_btns[ch] = btn
             do_grid.addLayout(cell, idx // 3, idx % 3)
+
+        self.btn_manual_off_all = QPushButton("Выкл. всё")
+        self.btn_manual_off_all.setStyleSheet(
+            "font-size: 12px; font-weight: bold; padding: 4px 6px; background-color: #f8d7da;"
+        )
+        self.btn_manual_off_all.clicked.connect(self.stop_all)
+        do_grid.addWidget(self.btn_manual_off_all, 1, 2)
 
         srv_layout.addLayout(do_grid)
 
@@ -501,9 +551,9 @@ class ValveTestBench(QMainWindow):
         )
         srv_layout.addWidget(self.lbl_srv_ai)
 
-        self.lbl_srv_flow = QLabel("Расходомер (M-7041D, ID 86, Reg 10): 0 ед.")
+        self.lbl_srv_flow = QLabel("M-7041D (ID 86): Вх.10 (Прям.) = 0 | Вх.11 (Обр.) = 0 | Вх.12 (Педаль) = 0")
         self.lbl_srv_flow.setStyleSheet(
-            "background-color: #fff3cd; padding: 4px 6px; font-size: 13px; font-weight: bold; border-radius: 3px;"
+            "background-color: #fff3cd; padding: 4px 6px; font-size: 12px; font-weight: bold; border-radius: 3px;"
         )
         srv_layout.addWidget(self.lbl_srv_flow)
 
@@ -535,7 +585,7 @@ class ValveTestBench(QMainWindow):
         self.btn_rev.clicked.connect(self.start_reverse_test)
 
         self.btn_stop = QPushButton("СТОП!!!")
-        self.btn_stop.setStyleSheet("background-color: red; color: white; height: 50px; font-weight: bold; font-size: 16px;")
+        self.btn_stop.setStyleSheet("background-color: red; color: white; height: 50px; font-weight: bold; font-size: 26px;")
         self.btn_stop.clicked.connect(self.stop_all)
 
         control_layout.addWidget(self.btn_auto)
@@ -563,6 +613,7 @@ class ValveTestBench(QMainWindow):
 
         main_layout.addWidget(right_pane, stretch=1)
         self.set_buttons_enabled(False)
+        self._update_manual_buttons()
         self.refresh_com_ports()
         self.statusBar().showMessage("Инициализация...")
 
@@ -571,6 +622,7 @@ class ValveTestBench(QMainWindow):
             self.port_ok = True
             self.do_ok = self.ai_ok = self.flow_ok = True
             self.set_buttons_enabled(True)
+            self._update_manual_buttons()
             self._update_status_bar()
             self.log("Запущено в тестовом режиме (DUMMY_MODE = True).")
             return
@@ -582,8 +634,9 @@ class ValveTestBench(QMainWindow):
             addr_ao=self.ADDR_AO,
             ai_ch=self.AI_PRESSURE_CH,
             addr_flow=self.ADDR_FLOW,
-            flow_reg=self.FLOW_INPUT_REG,
-            flow_clear_coil=self.FLOW_CLEAR_COIL,
+            flow_reg_start=self.FLOW_FWD_REG,
+            flow_fwd_clear_coil=self.FLOW_FWD_CLEAR_COIL,
+            flow_rev_clear_coil=self.FLOW_REV_CLEAR_COIL,
             min_ma=self.MIN_MA,
             max_ma=self.MAX_MA,
             min_p=self.MIN_P,
@@ -595,11 +648,34 @@ class ValveTestBench(QMainWindow):
         self.worker.slaves_status_changed.connect(self.on_slaves_status_changed)
         self.worker.start()
 
-    def on_telemetry_updated(self, raw_ma, pressure, flow):
+    def on_telemetry_updated(self, raw_ma, pressure, flow_fwd, flow_rev, pedal_count):
         self.raw_pressure_ma = raw_ma
         self.current_pressure = pressure
+        self.pedal_count = pedal_count
+
         if time.time() >= self.ignore_flow_until:
-            self.current_flow = flow
+            self.flow_fwd = flow_fwd
+            self.flow_rev = flow_rev
+
+        # Обработка педали (вход 12) с защитой при первом чтении и антидребезгом 1.0 сек
+        if self.last_pedal_count is None:
+            self.last_pedal_count = pedal_count
+        elif pedal_count != self.last_pedal_count:
+            self.last_pedal_count = pedal_count
+            now = time.time()
+            if now >= self.pedal_lock_until:
+                self.pedal_lock_until = now + self.PEDAL_DEBOUNCE_TIME
+                self.on_pedal_pressed()
+
+    def on_pedal_pressed(self):
+        """Реакция на нажатие педали: Старт авто-теста или Стоп"""
+        if self.state == "IDLE":
+            if self._is_system_ready():
+                self.log("[ПЕДАЛЬ] Нажатие -> Запуск Авто-теста")
+                self.start_auto_test()
+        else:
+            self.log("[ПЕДАЛЬ] Нажатие -> Остановка системы")
+            self.stop_all()
 
     def on_connection_changed(self, is_connected, message, is_initial):
         self.port_ok = is_connected
@@ -607,6 +683,7 @@ class ValveTestBench(QMainWindow):
             self.log(message)
         else:
             self.do_ok = self.ai_ok = self.flow_ok = False
+            self.last_pedal_count = None
             self.log(message, is_error=True)
             if self.state != "IDLE":
                 self.log("Текущий тест прерван из-за обрыва связи с COM-портом.", is_error=True)
@@ -617,6 +694,7 @@ class ValveTestBench(QMainWindow):
                 self.do_states[ch] = False
                 self.update_valve_ui(ch, False)
             self.set_buttons_enabled(False)
+        self._update_manual_buttons()
         self._update_status_bar()
 
     def on_slaves_status_changed(self, do_ok, ai_ok, flow_ok):
@@ -674,7 +752,9 @@ class ValveTestBench(QMainWindow):
         if self.worker is not None:
             self.port_ok = False
             self.do_ok = self.ai_ok = self.flow_ok = False
+            self.last_pedal_count = None
             self.set_buttons_enabled(False)
+            self._update_manual_buttons()
             self._update_status_bar()
             self.worker.enqueue_change_port(self.COM_PORT)
 
@@ -691,11 +771,21 @@ class ValveTestBench(QMainWindow):
             if ok and pwd == "0000":
                 self.service_mode = True
                 self.refresh_com_ports()
+                self._update_manual_buttons()
                 self.service_panel.setVisible(True)
                 self.btn_service.setText("Выйти из сервиса")
                 self.log("Сервисный режим активирован.")
             elif ok:
                 self.log("Неверный пароль сервисного режима!", is_error=True)
+
+    def toggle_manual_do(self, channel: int):
+        """Ручное переключение клапана или насоса из сервисного меню"""
+        if self.state != "IDLE" or not self.port_ok:
+            return
+        new_state = not self.do_states[channel]
+        self.write_do(channel, new_state)
+        name = self.DO_NAMES.get(channel, f"DO{channel}")
+        self.log(f"[СЕРВИС] {name} -> {'ВКЛ' if new_state else 'ВЫКЛ'}")
 
     def clear_log(self):
         self.log_console.clear()
@@ -705,9 +795,9 @@ class ValveTestBench(QMainWindow):
         self.btn_fwd.setEnabled(is_enabled)
         self.btn_rev.setEnabled(is_enabled)
         alpha = "255" if is_enabled else "100"
-        self.btn_auto.setStyleSheet(f"background-color: rgba(255, 215, 0, {alpha}); height: 50px; font-weight: bold; font-size: 14px;")
-        self.btn_fwd.setStyleSheet(f"background-color: rgba(173, 216, 230, {alpha}); height: 50px; font-weight: bold; font-size: 14px;")
-        self.btn_rev.setStyleSheet(f"background-color: rgba(144, 238, 144, {alpha}); height: 50px; font-weight: bold; font-size: 14px;")
+        self.btn_auto.setStyleSheet(f"background-color: rgba(255, 215, 0, {alpha}); height: 50px; font-weight: bold; font-size: 24px;")
+        self.btn_fwd.setStyleSheet(f"background-color: rgba(173, 216, 230, {alpha}); height: 50px; font-weight: bold; font-size: 24px;")
+        self.btn_rev.setStyleSheet(f"background-color: rgba(144, 238, 144, {alpha}); height: 50px; font-weight: bold; font-size: 24px;")
 
     def update_valve_ui(self, channel, state):
         if channel in self.do_leds:
@@ -742,11 +832,18 @@ class ValveTestBench(QMainWindow):
         if not DUMMY_MODE and self.worker is not None and self.port_ok:
             self.worker.enqueue_do(channel, state)
 
-    def clear_flow_counter(self):
-        self.current_flow = 0
+    def clear_flow_counter(self, is_reverse=False):
+        """Сброс нужного счетчика: Coil 522 (вход 10, прямой) или Coil 523 (вход 11, обратный)"""
+        if is_reverse:
+            self.flow_rev = 0
+            coil = self.FLOW_REV_CLEAR_COIL
+        else:
+            self.flow_fwd = 0
+            coil = self.FLOW_FWD_CLEAR_COIL
+
         self.ignore_flow_until = time.time() + 0.4
         if not DUMMY_MODE and self.worker is not None and self.port_ok:
-            self.worker.enqueue_clear_flow()
+            self.worker.enqueue_clear_flow(coil)
 
     # ================== БИЗНЕС ЛОГИКА ==================
     def start_auto_test(self):
@@ -762,11 +859,11 @@ class ValveTestBench(QMainWindow):
         if not keep_auto:
             self.is_auto_mode = False
         self.set_buttons_enabled(False)
-        self.log("--- СТАРТ: Прямой тест ---")
+        self.log("--- СТАРТ: Прямой тест (датчик вход 10) ---")
         self.time_data, self.pressure_data = [], []
         self.start_time = time.time()
 
-        self.clear_flow_counter()
+        self.clear_flow_counter(is_reverse=False)
 
         self.write_do(self.DO_VALVE_FWD_IN, True)
         self.write_do(self.DO_VALVE_FWD_OUT, True)
@@ -775,6 +872,7 @@ class ValveTestBench(QMainWindow):
 
         QTimer.singleShot(500, lambda: self.write_do(self.DO_PUMP_START, True))
         self.state = "FWD_WAIT_OPEN"
+        self._update_manual_buttons()
 
     def start_reverse_test(self, keep_auto=False):
         if not self._is_system_ready():
@@ -783,14 +881,14 @@ class ValveTestBench(QMainWindow):
             self.is_auto_mode = False
         self.set_buttons_enabled(False)
         self.log(
-            f"--- СТАРТ: Обратный тест (стабилизация {int(self.REV_STABILIZE_TIME)} сек + "
+            f"--- СТАРТ: Обратный тест (датчик вход 11, стабилизация {int(self.REV_STABILIZE_TIME)} сек + "
             f"контроль {int(self.REV_TEST_TIME)} сек) ---"
         )
         self.time_data, self.pressure_data = [], []
         self.start_time = time.time()
         self.rev_flow_baseline = 0
 
-        self.clear_flow_counter()
+        self.clear_flow_counter(is_reverse=True)
 
         self.write_do(self.DO_VALVE_FWD_IN, False)
         self.write_do(self.DO_VALVE_FWD_OUT, False)
@@ -799,6 +897,7 @@ class ValveTestBench(QMainWindow):
 
         QTimer.singleShot(500, lambda: self.write_do(self.DO_PUMP_START, True))
         self.state = "REV_STABILIZE"
+        self._update_manual_buttons()
 
     def stop_all(self):
         if self.state != "IDLE":
@@ -814,6 +913,7 @@ class ValveTestBench(QMainWindow):
         self.is_auto_mode = False
         self.auto_pause_start_time = None
         self.set_buttons_enabled(self._is_system_ready())
+        self._update_manual_buttons()
 
     # ================== ГЛАВНЫЙ ЦИКЛ UI ==================
     def main_loop(self):
@@ -821,15 +921,15 @@ class ValveTestBench(QMainWindow):
             if self.state == "FWD_WAIT_OPEN":
                 self.current_pressure += 0.08
                 if self.current_pressure > 1.5:
-                    self.current_flow += 5
+                    self.flow_fwd += 5
             elif self.state == "FWD_WAIT_CLOSE":
-                self.current_pressure -= 0.08
-                if self.current_pressure < 0.6:
-                    self.current_flow = 0
+                self.current_pressure = max(0.0, self.current_pressure - 0.08)
+                if self.current_pressure >= 0.6:
+                    self.flow_fwd += 2
             elif self.state in ["REV_STABILIZE", "REV_TEST"]:
                 self.current_pressure = min(2.5, self.current_pressure + 0.05)
                 if self.state == "REV_STABILIZE" and self.current_pressure < 1.0:
-                    self.current_flow = 2  # Имитация пары импульсов при наборе давления
+                    self.flow_rev = 2
             else:
                 self.current_pressure = max(0.0, self.current_pressure - 0.1)
             self.raw_pressure_ma = self.MIN_MA + (self.current_pressure / self.MAX_P) * (self.MAX_MA - self.MIN_MA)
@@ -844,7 +944,7 @@ class ValveTestBench(QMainWindow):
                 f"AI5 (I-7017, #025): Ток = {self.raw_pressure_ma:.3f} мА | Давление = {self.current_pressure:.2f} атм"
             )
             self.lbl_srv_flow.setText(
-                f"Расходомер (M-7041D, ID 86, Reg 10): {self.current_flow} ед."
+                f"M-7041D (ID 86): Вх.10 (Прям.) = {self.flow_fwd} | Вх.11 (Обр.) = {self.flow_rev} | Вх.12 (Педаль) = {self.pedal_count}"
             )
 
         if self.state not in ["IDLE", "AUTO_PAUSE"] or self.current_pressure > 0.1:
@@ -858,21 +958,28 @@ class ValveTestBench(QMainWindow):
         if self.state == "FWD_WAIT_OPEN":
             t_elapsed = time.time() - self.start_time
 
-            if self.current_flow > 0:
+            if self.flow_fwd > 0:
                 self.fixed_open = self.current_pressure
                 self.log(f"ОТКРЫТИЕ зафиксировано: {self.fixed_open:.2f} атм")
                 self.write_do(self.DO_PUMP_START, False)
+                self.last_flow_val = self.flow_fwd
+                self.last_flow_time = time.time()
+                self.last_flow_pressure = self.current_pressure
                 self.state = "FWD_WAIT_CLOSE"
             elif t_elapsed >= 30.0 and self.current_pressure > 0.1:
                 self.log(
-                    "ОШИБКА: Нет расхода в течение 30 сек при наличии давления! Проверьте исправность расходомера.",
+                    "ОШИБКА: Нет расхода (вход 10) в течение 30 сек при наличии давления! Проверьте исправность расходомера.",
                     is_error=True
                 )
                 self.stop_all()
 
         elif self.state == "FWD_WAIT_CLOSE":
-            if self.current_flow == 0:
-                closing_pressure = self.current_pressure
+            if self.flow_fwd != self.last_flow_val:
+                self.last_flow_val = self.flow_fwd
+                self.last_flow_time = time.time()
+                self.last_flow_pressure = self.current_pressure
+            elif time.time() - self.last_flow_time >= self.FLOW_STOP_TIMEOUT:
+                closing_pressure = self.last_flow_pressure
                 self.log(f"ЗАКРЫТИЕ зафиксировано: {closing_pressure:.2f} атм")
                 self.log(f"Итог прямого теста: Открытие {self.fixed_open:.2f} атм | Закрытие {closing_pressure:.2f} атм")
 
@@ -911,21 +1018,21 @@ class ValveTestBench(QMainWindow):
         elif self.state == "REV_STABILIZE":
             t_elapsed = time.time() - self.start_time
             if t_elapsed >= self.REV_STABILIZE_TIME:
-                self.rev_flow_baseline = self.current_flow
+                self.rev_flow_baseline = self.flow_rev
                 self.rev_test_start_time = time.time()
                 self.log(
-                    f"Стабилизация завершена (база счетчика: {self.rev_flow_baseline} ед.). "
+                    f"Стабилизация завершена (база счетчика вход 11: {self.rev_flow_baseline} ед.). "
                     f"Начат контроль герметичности ({int(self.REV_TEST_TIME)} сек)..."
                 )
                 self.state = "REV_TEST"
 
         elif self.state == "REV_TEST":
             t_test = time.time() - self.rev_test_start_time
-            delta_flow = self.current_flow - self.rev_flow_baseline
+            delta_flow = self.flow_rev - self.rev_flow_baseline
 
             if delta_flow > 0:
                 self.log(
-                    f"РЕЗУЛЬТАТ ОБРАТНОГО ТЕСТА: БРАК! Протечка клапана (+{delta_flow} ед.) "
+                    f"РЕЗУЛЬТАТ ОБРАТНОГО ТЕСТА: БРАК! Протечка клапана (+{delta_flow} ед. по входу 11) "
                     f"на {t_test:.1f} сек контроля ({self.current_pressure:.2f} атм).",
                     is_error=True
                 )
