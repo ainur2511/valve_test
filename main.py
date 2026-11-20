@@ -1,19 +1,9 @@
-import sys
 import os
-
-def resource_path(filename: str) -> str:
-    """Путь к ресурсам (shem.png), вшитым в exe"""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, filename)
-
-def app_dir() -> str:
-    """Папка, в которой лежит exe (или main.py) — для config.ini"""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+import sys
 import time
 import queue
 import logging
+from logging.handlers import RotatingFileHandler
 from serial import SerialException
 from serial.tools import list_ports
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -25,11 +15,36 @@ from PyQt6.QtCore import QTimer, Qt, QSettings, QThread, pyqtSignal
 import pyqtgraph as pg
 from pymodbus.client import ModbusSerialClient
 
+
+def resource_path(filename: str) -> str:
+    """Путь к ресурсам (shem.png), вшитым в exe"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, filename)
+
+
+def app_dir() -> str:
+    """Папка, в которой лежит exe (или main.py) — для config.ini и debug.log"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# Настройка файлового логирования (debug.log рядом с программой, до 5 МБ x 3 файла)
+log_path = os.path.join(app_dir(), "debug.log")
+file_handler = RotatingFileHandler(
+    log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+logger = logging.getLogger("valve_bench")
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+
 # Убираем спам pymodbus из консоли Python
 logging.getLogger("pymodbus").setLevel(logging.CRITICAL)
 
 # Поставьте True для проверки без подключенного стенда
-DUMMY_MODE = True
+DUMMY_MODE = False
 
 
 class CommWorker(QThread):
@@ -88,6 +103,9 @@ class CommWorker(QThread):
     def enqueue_change_port(self, new_port: str):
         self.cmd_queue.put(("change_port", new_port))
 
+    def enqueue_force_reconnect(self):
+        self.cmd_queue.put(("force_reconnect",))
+
     def stop(self):
         self._running = False
 
@@ -106,7 +124,7 @@ class CommWorker(QThread):
             try:
                 self.modbus.close()
             except Exception:
-                pass
+                logger.exception("Ошибка при закрытии COM-порта")
             self.modbus = None
 
     def _try_connect(self):
@@ -119,13 +137,18 @@ class CommWorker(QThread):
                 retries=0
             )
             ok = self.modbus.connect()
+            # Обязательный таймаут на запись — защита от вечного зависания драйвера USB-RS485
+            if ok and self.modbus.socket is not None:
+                self.modbus.socket.write_timeout = 0.5
         except Exception:
+            logger.exception(f"Исключение при открытии {self.com_port}")
             ok = False
 
         if ok:
             self.connected = True
             self.err_do = self.err_ai = self.err_flow = 0
             self.do_ok = self.ai_ok = self.flow_ok = False
+            logger.info(f"COM-порт {self.com_port} успешно открыт (baud={self.baudrate}, write_timeout=0.5)")
             msg = (f"Порт {self.com_port} открыт. Проверка связи с модулями..."
                    if self._initial_attempt
                    else f"Порт {self.com_port} восстановлен. Проверка связи с модулями...")
@@ -135,14 +158,16 @@ class CommWorker(QThread):
         else:
             self.connected = False
             if self._initial_attempt:
+                logger.error(f"Не удалось открыть {self.com_port} при старте")
                 msg = (f"ОШИБКА: Не удалось открыть {self.com_port}! "
                        f"Подключите кабель или выберите другой порт в сервисном режиме.")
                 self.connection_changed.emit(False, msg, True)
                 self._initial_attempt = False
 
-    def _handle_disconnect(self):
+    def _handle_disconnect(self, reason=""):
         if not self.connected:
             return
+        logger.error(f"Обрыв связи с {self.com_port}: {reason}")
         self.connected = False
         self.last_reconnect_time = time.time()
         self._close_port()
@@ -177,12 +202,18 @@ class CommWorker(QThread):
 
             action = cmd[0]
             if action == "change_port":
+                logger.info(f"Смена COM-порта на {cmd[1]}")
                 self.com_port = cmd[1]
                 self.connected = False
                 self._initial_attempt = True
                 self._close_port()
                 self._reset_slaves_status()
                 self.last_reconnect_time = 0.0
+                return
+
+            if action == "force_reconnect":
+                logger.warning("Принудительное переподключение COM-порта по команде UI")
+                self._handle_disconnect("force_reconnect")
                 return
 
             if not self.connected:
@@ -192,21 +223,32 @@ class CommWorker(QThread):
                 if action == "write_do":
                     _, channel, state = cmd
                     val = 1 if state else 0
-                    self._send_dcon(f"#{self.addr_do}1{channel}0{val}")
+                    logger.debug(f"CMD write_do: ch={channel}, val={val}, qsize={self.cmd_queue.qsize()}")
+                    t0 = time.monotonic()
+                    resp = self._send_dcon(f"#{self.addr_do}1{channel}0{val}")
+                    dt = time.monotonic() - t0
+                    if dt > 0.5:
+                        logger.warning(f"Долгая запись DO{channel}: {dt:.2f} сек, ответ={resp!r}")
                 elif action == "clear_flow":
                     _, coil = cmd
+                    logger.debug(f"CMD clear_flow: coil={coil}, qsize={self.cmd_queue.qsize()}")
+                    t0 = time.monotonic()
                     self.modbus.write_coil(coil, True, device_id=self.addr_flow)
+                    dt = time.monotonic() - t0
+                    if dt > 0.5:
+                        logger.warning(f"Долгий сброс счетчика (coil {coil}): {dt:.2f} сек")
                     if coil == self.flow_fwd_clear_coil:
                         self.flow_fwd = 0
                     elif coil == self.flow_rev_clear_coil:
                         self.flow_rev = 0
-            except (SerialException, OSError):
-                self._handle_disconnect()
+            except (SerialException, OSError) as e:
+                self._handle_disconnect(f"Ошибка записи ({action}): {e}")
                 return
             except Exception:
-                pass
+                logger.exception(f"Неожиданная ошибка при выполнении команды {action}")
 
     def run(self):
+        logger.info("CommWorker запущен")
         while self._running:
             self._process_commands()
 
@@ -222,17 +264,28 @@ class CommWorker(QThread):
 
             try:
                 # 1. Проверка живости I-7050D (DCON $016 -> ответ вида !XXXX)
+                t0 = time.monotonic()
                 resp_do = self._send_dcon(f"${self.addr_do}6")
+                dt = time.monotonic() - t0
+                if dt > 0.5:
+                    logger.warning(f"Долгий ответ I-7050D ($016): {dt:.2f} сек, ответ={resp_do!r}")
+
                 if resp_do.startswith("!"):
                     self.err_do = 0
                     self.do_ok = True
                 else:
                     self.err_do += 1
-                    if self.err_do >= self.max_missed:
+                    if self.err_do == self.max_missed:
+                        logger.warning(f"I-7050D не отвечает {self.max_missed} раз подряд (последний ответ={resp_do!r})")
                         self.do_ok = False
 
                 # 2. Опрос давления I-7017 (DCON #025 -> ответ вида >+04.123)
+                t0 = time.monotonic()
                 resp_ai = self._send_dcon(f"#{self.addr_ao}{self.ai_ch}")
+                dt = time.monotonic() - t0
+                if dt > 0.5:
+                    logger.warning(f"Долгий ответ I-7017 (#025): {dt:.2f} сек, ответ={resp_ai!r}")
+
                 ai_parsed = False
                 if resp_ai.startswith(">"):
                     try:
@@ -243,20 +296,26 @@ class CommWorker(QThread):
                         )
                         ai_parsed = True
                     except ValueError:
-                        pass
+                        logger.warning(f"Некорректный ответ I-7017: {resp_ai!r}")
 
                 if ai_parsed:
                     self.err_ai = 0
                     self.ai_ok = True
                 else:
                     self.err_ai += 1
-                    if self.err_ai >= self.max_missed:
+                    if self.err_ai == self.max_missed:
+                        logger.warning(f"I-7017 не отвечает {self.max_missed} раз подряд (последний ответ={resp_ai!r})")
                         self.ai_ok = False
 
                 # 3. Опрос счетчиков M-7041D: Reg 10 (прямой), Reg 11 (обратный), Reg 12 (педаль)
+                t0 = time.monotonic()
                 res_flow = self.modbus.read_input_registers(
                     address=self.flow_reg_start, count=3, device_id=self.addr_flow
                 )
+                dt = time.monotonic() - t0
+                if dt > 0.5:
+                    logger.warning(f"Долгий ответ M-7041D (Modbus): {dt:.2f} сек")
+
                 if not res_flow.isError():
                     self.flow_fwd = res_flow.registers[0]
                     self.flow_rev = res_flow.registers[1]
@@ -265,26 +324,29 @@ class CommWorker(QThread):
                     self.flow_ok = True
                 else:
                     self.err_flow += 1
-                    if self.err_flow >= self.max_missed:
+                    if self.err_flow == self.max_missed:
+                        logger.warning(f"M-7041D не отвечает {self.max_missed} раз подряд")
                         self.flow_ok = False
 
                 # Уведомляем UI, если статус любого из модулей изменился
                 curr_status = (self.do_ok, self.ai_ok, self.flow_ok)
                 if curr_status != prev_status:
+                    logger.info(f"Смена статуса модулей: DO={self.do_ok}, AI={self.ai_ok}, FLOW={self.flow_ok}")
                     self.slaves_status_changed.emit(*curr_status)
 
                 self.telemetry_updated.emit(
                     self.raw_ma, self.pressure, self.flow_fwd, self.flow_rev, self.pedal_count
                 )
 
-            except (SerialException, OSError):
-                self._handle_disconnect()
+            except (SerialException, OSError) as e:
+                self._handle_disconnect(f"Ошибка чтения: {e}")
             except Exception:
-                pass
+                logger.exception("Неожиданная ошибка в цикле опроса CommWorker")
 
             self.msleep(150)
 
         self._close_port()
+        logger.info("CommWorker остановлен")
 
 
 class ValveTestBench(QMainWindow):
@@ -299,7 +361,12 @@ class ValveTestBench(QMainWindow):
         self.is_auto_mode = False
         self.ignore_flow_until = 0.0
 
-        # Загрузка сохраненного COM-порта из config.ini
+        # Сторож зависания фонового потока (UI-уровень)
+        self.WORKER_HANG_TIMEOUT = 3.0
+        self.last_worker_beat = 0.0
+        self.worker_hang_reported = False
+
+        # Загрузка сохраненного COM-порта из config.ini рядом с программой
         self.settings = QSettings(os.path.join(app_dir(), "config.ini"), QSettings.Format.IniFormat)
         self.COM_PORT = str(self.settings.value("com_port", "COM3"))
         self.BAUDRATE = 57600
@@ -377,6 +444,7 @@ class ValveTestBench(QMainWindow):
         self.time_data = []
         self.pressure_data = []
 
+        logger.info("=== ЗАПУСК ПРИЛОЖЕНИЯ ValveTestBench ===")
         self.init_ui()
         self.init_comm()
 
@@ -441,7 +509,9 @@ class ValveTestBench(QMainWindow):
 
         self.schematic_label = QLabel()
         try:
-            pixmap = QPixmap(resource_path("shem.png")).scaled(schem_w, schem_h, Qt.AspectRatioMode.IgnoreAspectRatio)
+            pixmap = QPixmap(resource_path("shem.png")).scaled(
+                schem_w, schem_h, Qt.AspectRatioMode.IgnoreAspectRatio
+            )
             self.schematic_label.setPixmap(pixmap)
             self.schematic_label.setFixedSize(schem_w, schem_h)
         except Exception:
@@ -481,7 +551,7 @@ class ValveTestBench(QMainWindow):
 
         # Кнопка сервисного режима
         self.btn_service = QPushButton("Сервисный режим")
-        self.btn_service.setStyleSheet("height: 36px; font-size: 13px; font-weight: bold;")
+        self.btn_service.setStyleSheet("height: 40px; font-size: 16px; font-weight: bold;")
         self.btn_service.clicked.connect(self.toggle_service_mode)
         left_layout.addWidget(self.btn_service)
 
@@ -502,12 +572,12 @@ class ValveTestBench(QMainWindow):
         self.combo_com.setStyleSheet("font-size: 13px; padding: 2px;")
 
         self.btn_refresh_ports = QPushButton("Обновить")
-        self.btn_refresh_ports.setStyleSheet("font-size: 12px; padding: 4px 8px;")
+        self.btn_refresh_ports.setStyleSheet("font-size: 13px; padding: 4px 8px;")
         self.btn_refresh_ports.clicked.connect(self.refresh_com_ports)
 
         self.btn_apply_port = QPushButton("Применить")
         self.btn_apply_port.setStyleSheet(
-            "font-size: 12px; font-weight: bold; padding: 4px 10px; background-color: #d1e7dd;"
+            "font-size: 13px; font-weight: bold; padding: 4px 10px; background-color: #d1e7dd;"
         )
         self.btn_apply_port.clicked.connect(self.apply_com_port)
 
@@ -528,7 +598,7 @@ class ValveTestBench(QMainWindow):
             cell.setContentsMargins(0, 0, 4, 0)
             led = self._create_led()
             btn = QPushButton(name)
-            btn.setStyleSheet("font-size: 12px; padding: 4px 6px;")
+            btn.setStyleSheet("font-size: 13px; padding: 4px 6px;")
             btn.clicked.connect(lambda checked, c=ch: self.toggle_manual_do(c))
             cell.addWidget(led)
             cell.addWidget(btn, stretch=1)
@@ -538,7 +608,7 @@ class ValveTestBench(QMainWindow):
 
         self.btn_manual_off_all = QPushButton("Выкл. всё")
         self.btn_manual_off_all.setStyleSheet(
-            "font-size: 12px; font-weight: bold; padding: 4px 6px; background-color: #f8d7da;"
+            "font-size: 13px; font-weight: bold; padding: 4px 6px; background-color: #f8d7da;"
         )
         self.btn_manual_off_all.clicked.connect(self.stop_all)
         do_grid.addWidget(self.btn_manual_off_all, 1, 2)
@@ -585,7 +655,7 @@ class ValveTestBench(QMainWindow):
         self.btn_rev.clicked.connect(self.start_reverse_test)
 
         self.btn_stop = QPushButton("СТОП!!!")
-        self.btn_stop.setStyleSheet("background-color: red; color: white; height: 50px; font-weight: bold; font-size: 26px;")
+        self.btn_stop.setStyleSheet("background-color: red; color: white; height: 55px; font-weight: bold; font-size: 20px;")
         self.btn_stop.clicked.connect(self.stop_all)
 
         control_layout.addWidget(self.btn_auto)
@@ -596,9 +666,9 @@ class ValveTestBench(QMainWindow):
 
         log_header_layout = QHBoxLayout()
         lbl_log_title = QLabel("Журнал событий:")
-        lbl_log_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        lbl_log_title.setStyleSheet("font-size: 15px; font-weight: bold;")
         self.btn_clear_log = QPushButton("Очистить сообщения")
-        self.btn_clear_log.setStyleSheet("padding: 4px 10px; font-size: 13px;")
+        self.btn_clear_log.setStyleSheet("padding: 4px 10px; font-size: 15px;")
         self.btn_clear_log.clicked.connect(self.clear_log)
 
         log_header_layout.addWidget(lbl_log_title)
@@ -649,6 +719,9 @@ class ValveTestBench(QMainWindow):
         self.worker.start()
 
     def on_telemetry_updated(self, raw_ma, pressure, flow_fwd, flow_rev, pedal_count):
+        self.last_worker_beat = time.monotonic()
+        self.worker_hang_reported = False
+
         self.raw_pressure_ma = raw_ma
         self.current_pressure = pressure
         self.pedal_count = pedal_count
@@ -680,6 +753,8 @@ class ValveTestBench(QMainWindow):
     def on_connection_changed(self, is_connected, message, is_initial):
         self.port_ok = is_connected
         if is_connected:
+            self.last_worker_beat = time.monotonic()
+            self.worker_hang_reported = False
             self.log(message)
         else:
             self.do_ok = self.ai_ok = self.flow_ok = False
@@ -795,9 +870,9 @@ class ValveTestBench(QMainWindow):
         self.btn_fwd.setEnabled(is_enabled)
         self.btn_rev.setEnabled(is_enabled)
         alpha = "255" if is_enabled else "100"
-        self.btn_auto.setStyleSheet(f"background-color: rgba(255, 215, 0, {alpha}); height: 50px; font-weight: bold; font-size: 24px;")
-        self.btn_fwd.setStyleSheet(f"background-color: rgba(173, 216, 230, {alpha}); height: 50px; font-weight: bold; font-size: 24px;")
-        self.btn_rev.setStyleSheet(f"background-color: rgba(144, 238, 144, {alpha}); height: 50px; font-weight: bold; font-size: 24px;")
+        self.btn_auto.setStyleSheet(f"background-color: rgba(255, 215, 0, {alpha}); height: 55px; font-weight: bold; font-size: 18px;")
+        self.btn_fwd.setStyleSheet(f"background-color: rgba(173, 216, 230, {alpha}); height: 55px; font-weight: bold; font-size: 18px;")
+        self.btn_rev.setStyleSheet(f"background-color: rgba(144, 238, 144, {alpha}); height: 55px; font-weight: bold; font-size: 18px;")
 
     def update_valve_ui(self, channel, state):
         if channel in self.do_leds:
@@ -818,10 +893,13 @@ class ValveTestBench(QMainWindow):
     def log(self, text, is_error=False, is_success=False):
         t = time.strftime("%H:%M:%S")
         if is_error:
+            logger.error(text)
             html = f'<span style="color: #d90000; font-weight: bold;">[{t}] {text}</span>'
         elif is_success:
+            logger.info(text)
             html = f'<span style="color: #008000; font-weight: bold;">[{t}] {text}</span>'
         else:
+            logger.info(text)
             html = f'<span>[{t}] {text}</span>'
         self.log_console.append(html)
 
@@ -936,6 +1014,22 @@ class ValveTestBench(QMainWindow):
 
         if not self.port_ok:
             return
+
+        # Проверка зависания фонового потока (если нет телеметрии > 3 сек при открытом порте)
+        if not DUMMY_MODE and self.last_worker_beat > 0:
+            silence = time.monotonic() - self.last_worker_beat
+            if silence > self.WORKER_HANG_TIMEOUT and not self.worker_hang_reported:
+                self.worker_hang_reported = True
+                self.log(
+                    f"АВАРИЯ: Зависание обмена по {self.COM_PORT} (нет данных {silence:.1f} сек)! "
+                    f"Попытка переподключения...",
+                    is_error=True
+                )
+                if self.state != "IDLE":
+                    self.stop_all()
+                if self.worker is not None:
+                    self.worker.enqueue_force_reconnect()
+                return
 
         self.lbl_pump_press.setText(f"{self.current_pressure:.2f}")
 
@@ -1053,6 +1147,7 @@ class ValveTestBench(QMainWindow):
                 self.stop_all()
 
     def closeEvent(self, event):
+        logger.info("Закрытие приложения...")
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(1000)
